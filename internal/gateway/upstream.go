@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"opencode2api/internal/config"
@@ -336,6 +337,75 @@ const defaultMaxAnonymousExits = 8
 
 // maxAnonymousExits returns the configured cap, or the built-in default when
 // the operator left the setting unset.
+// burnedSessionTTL is how long a session that drew a free-tier quota 429
+// stays pre-rotated. Buckets reset daily at 00:00 UTC and short-window
+// throttles clear in minutes; 15 minutes skips the wasted leg through a burn
+// episode while re-testing the original identity soon enough to regain its
+// affinity once the bucket recovers. A rotation that outlives its usefulness
+// costs nothing worse than a cold upstream cache for one request.
+const burnedSessionTTL = 15 * time.Minute
+
+// maxBurnedSessions bounds the pre-rotation memory. Sessions are
+// high-cardinality in the worst case, so the map evicts expired entries
+// first and a random one past the cap.
+const maxBurnedSessions = 512
+
+// burnedSessions is the gateway's short memory of upstream sessions whose
+// free-tier bucket is exhausted. Its zero value is unusable; build it with
+// newBurnedSessions.
+type burnedSessions struct {
+	mu    sync.Mutex
+	until map[string]int64
+}
+
+func newBurnedSessions() *burnedSessions {
+	return &burnedSessions{until: make(map[string]int64)}
+}
+
+// burned reports whether session drew a quota 429 inside the TTL window.
+func (b *burnedSessions) burned(session string) bool {
+	if b == nil || session == "" {
+		return false
+	}
+	now := time.Now().UnixNano()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	exp, ok := b.until[session]
+	if !ok {
+		return false
+	}
+	if exp <= now {
+		delete(b.until, session)
+		return false
+	}
+	return true
+}
+
+// note records session as burned starting now. It is called with the identity
+// that received the 429, before the retry leg mints its replacement.
+func (b *burnedSessions) note(session string) {
+	if b == nil || session == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.until) >= maxBurnedSessions {
+		now := time.Now().UnixNano()
+		for s, exp := range b.until {
+			if exp <= now {
+				delete(b.until, s)
+			}
+		}
+	}
+	for len(b.until) >= maxBurnedSessions {
+		for s := range b.until {
+			delete(b.until, s)
+			break
+		}
+	}
+	b.until[session] = time.Now().Add(burnedSessionTTL).UnixNano()
+}
+
 func (g *Gateway) maxAnonymousExits() int {
 	if g != nil && g.cfg.Performance.MaxAnonymousExits > 0 {
 		return g.cfg.Performance.MaxAnonymousExits
@@ -375,6 +445,15 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// then reports errDeterministicClientRejection so the caller keeps this
 	// 4xx instead of replacing it with a later tier's answer.
 	halted := false
+	// A session that recently drew a quota 429 is still burned: its cursor
+	// would walk the same first exit for a wasted leg. Start on a fresh
+	// identity instead; the per-leg rotation below stays as the safety net
+	// for sessions burning for the first time.
+	if g.sesrot.burned(ids.Session) {
+		ids.Session = identity.CanonicalSessionID(identity.RandomID("sesrot", 8))
+		ids.Project = identity.RandomProjectID()
+		g.logger.Info("anonymous session still burned; starting on a fresh identity", "component", "upstream", "event", "anonymous_session_prerotated", "request_id", ids.Request, "tier", config.TierZen)
+	}
 	cursor := g.anonymous.CursorFor(ids.Session)
 	limit := min(g.anonymous.Len(), g.maxAnonymousExits())
 	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
@@ -498,6 +577,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				// Mint a fresh identity for the next exit instead. Affinity
 				// loss is confined to this request's retry legs; the next
 				// client request re-derives its own session as before.
+				g.sesrot.note(ids.Session)
 				ids.Session = identity.CanonicalSessionID(identity.RandomID("sesrot", 8))
 				ids.Project = identity.RandomProjectID()
 				g.logger.Info("anonymous upstream exhausted the session bucket; rotating identity", "component", "upstream", "event", "anonymous_session_rotated", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())

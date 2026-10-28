@@ -93,6 +93,10 @@ type Gateway struct {
 	// freeTierBlock is how long an exit the free tier flagged stays out of the
 	// anonymous cursor. Zero uses freeTierBlockTTL.
 	freeTierBlock time.Duration
+	// sesrot remembers sessions that recently drew a free-tier quota 429, so
+	// the next request carrying one starts on a fresh identity instead of
+	// replaying the burned bucket for a wasted leg.
+	sesrot *burnedSessions
 }
 
 // New builds a Gateway for cfg: one proxy transport per runtime proxy (a
@@ -135,6 +139,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 		monitor:        monitor,
 		attemptTimeout: attemptDeadline(cfg),
 		freeTierBlock:  time.Duration(cfg.Performance.FreeTierBlockSeconds) * time.Second,
+		sesrot:         newBurnedSessions(),
 	}, nil
 }
 
