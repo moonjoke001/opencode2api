@@ -274,6 +274,39 @@ Sessions and projects the gateway derives itself are scoped to the caller's serv
 
 Cooldowns grow exponentially up to eight times `performance.failure_cooldown_seconds`, and a longer `Retry-After` is honored. A configured `models.anonymous_backoff` breaker is a separate lane-level guard: it pauses the whole anonymous lane for hours, while these cooldowns stay per exit and short. If every authenticated key is cooling down, routing may try the key whose cooldown ends first. Anonymous nodes still in cooldown are skipped.
 
+### Session rotation on quota 429 (patch branch only)
+
+> This subsection documents the `patch` branch maintained in this fork. It is
+> not in upstream. Base: upstream `v1.4.5` + two local commits.
+
+The free tier meters quota per project id and egress (upstream issue #156):
+once a session burns its bucket, every remaining exit answers `429 Free
+usage limit reached` for the same identity. Two local changes recover those
+requests instead of failing them:
+
+1. **Per-leg rotation** — when an anonymous attempt draws a quota 429 (status
+   429 carrying the "Free usage limit" message), the next exit is tried under
+   a freshly minted session (`CanonicalSessionID` over a random signal, so the
+   timestamp stays inside the upstream window) and a fresh project id. Only
+   quota 429s trigger it; edge rate limits keep the old behavior. Logged as
+   `anonymous_session_rotated`.
+2. **Pre-rotation of burned sessions** — sessions that recently drew a quota
+   429 are remembered for 15 minutes (bounded in-memory set). The next request
+   carrying one starts on a fresh identity immediately instead of spending its
+   first leg re-proving the bucket is burned. Logged as
+   `anonymous_session_prerotated`. Healthy sessions are untouched, so normal
+   affinity and prompt-cache behavior is preserved.
+
+The walk order itself stays deterministic per session (stable hash decides the
+first exit); only the identity rotates. Cooling a proxy name does not help
+here: `#pool` nodes are never cooled by design, so per-exit cooling would be
+a no-op — the bucket is bound to the identity, not the exit.
+
+Operator notes: the image reports its version as `v1.4.5-sesrotN` in
+`/healthz`; both changes are anonymous-lane only (WARP path and keyed tiers
+untouched). Rebase onto each new upstream release; the next release build
+replaces this image.
+
 ## Configuration reference
 
 See [config.example.json](config.example.json) for a complete starting configuration. JSON supports `//` and `/* ... */` comments; unknown fields and invalid values are rejected.
