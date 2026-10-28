@@ -100,6 +100,20 @@ func peekNetworkAbuseBlock(resp *http.Response) bool {
 	return isNetworkAbuseBlock(resp.StatusCode, peekResponseBody(resp))
 }
 
+// isFreeUsageLimit reports whether resp is the free tier's quota exhaustion:
+// HTTP 429 carrying the "Free usage limit reached" message. A burned
+// project x egress bucket answers this on every exit, so the caller can mint
+// a fresh session/project and try the next exit under a new bucket instead of
+// replaying the same one (see issue #156: randomizing both recovered 0/8 to
+// 8/8). Other 429s (edge rate limits, empty bodies) keep the old behavior.
+func isFreeUsageLimit(resp *http.Response) bool {
+	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		return false
+	}
+	text := strings.ToLower(string(peekResponseBody(resp)))
+	return strings.Contains(text, "free usage limit")
+}
+
 // errDeterministicClientRejection reports that the upstream rejected the
 // request itself: the body is malformed, too long for the model, or fails the
 // same validation on every credential. Retrying on another key, lane or tier

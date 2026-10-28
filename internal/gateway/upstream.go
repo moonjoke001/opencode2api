@@ -491,6 +491,16 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				halted = true
 				g.logger.Warn("upstream rejected the request; not trying other upstreams", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 				break
+			} else if isFreeUsageLimit(resp) {
+				// The free tier ledges quota per project id and egress: this
+				// 429 means the session/project on the wire just burned its
+				// bucket, and every remaining exit would answer the same way.
+				// Mint a fresh identity for the next exit instead. Affinity
+				// loss is confined to this request's retry legs; the next
+				// client request re-derives its own session as before.
+				ids.Session = identity.CanonicalSessionID(identity.RandomID("sesrot", 8))
+				ids.Project = identity.RandomProjectID()
+				g.logger.Info("anonymous upstream exhausted the session bucket; rotating identity", "component", "upstream", "event", "anonymous_session_rotated", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			} else {
 				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			}
